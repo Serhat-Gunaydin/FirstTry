@@ -1,0 +1,293 @@
+# -*- coding: utf-8 -*-
+"""
+PresentationMaker.py
+- Şablondan il sunumu üretir.
+- Slaytlar: İl Ana Sayfası (başlık güncellenir), İl Değerlendirme (dokunulmaz),
+  2022/2023/2024 grafik sayfaları, tesis sayfaları (ilk 5 tek tek, kalanlar 2x2 grid).
+- Excel sayfaları PNG'e güvenli COM yöntemiyle aktarılır (Türkçe adlar destekli).
+"""
+
+import os
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+import openpyxl
+from pptx import Presentation
+from pptx.util import Inches, Pt
+from pptx.enum.text import PP_ALIGN
+
+# -----------------------------
+# YOL SABİTLERİ
+# -----------------------------
+OUTPUT_DIR    = Path(r"C:\Users\serhat.gunaydin\Desktop\Türkiye Değerlendirme Kodlar\2024 İl Değerlendirme\Çıktılar")
+TABLE_DIR     = OUTPUT_DIR / "Tablolar"
+GRAPH_DIR     = OUTPUT_DIR / "Grafikler"
+SUNUM_DIR     = OUTPUT_DIR / "Sunumlar"
+TEMPLATE_PATH = SUNUM_DIR / "Sunu Şablon.pptx"
+
+YEARS = [2022, 2023, 2024]
+IL_FILTER = ["Ankara"]  # Tüm iller için: IL_FILTER = None
+
+# -----------------------------
+# PPT yardımcıları
+# -----------------------------
+def get_or_create_title(slide, text, font_size=28, bold=True, align=PP_ALIGN.LEFT):
+    """Slaytta title placeholder yoksa üstte geniş bir textbox oluşturup metni yazar."""
+    title_shape = slide.shapes.title
+    if title_shape is None:
+        title_shape = slide.shapes.add_textbox(Inches(0.6), Inches(0.3), Inches(12.8), Inches(1.0))
+    tf = title_shape.text_frame
+    tf.clear()
+    p = tf.paragraphs[0]
+    p.text = text
+    p.font.size = Pt(font_size)
+    p.font.bold = bold
+    p.alignment = align
+    return title_shape
+
+def add_picture_scaled(prs, slide, img_path, left=Inches(0.5), top=Inches(1.2),
+                       max_width=Inches(12.5), max_height=Inches(6.3), center=True):
+    """
+    Resmi orantılı küçültüp sayfaya taşmadan yerleştirir; center=True ise
+    PRS boyutlarını kullanarak SLAYT MERKEZİNE oturtur.
+    """
+    pic = slide.shapes.add_picture(str(img_path), left, top)
+    # Boyutu sınırla
+    if pic.width > max_width or pic.height > max_height:
+        ratio = min(max_width / pic.width, max_height / pic.height)
+        pic.width = int(pic.width * ratio)
+        pic.height = int(pic.height * ratio)
+    if center:
+        slide_w = prs.slide_width
+        slide_h = prs.slide_height
+        pic.left = int((slide_w - pic.width) / 2)
+        pic.top  = int((slide_h - pic.height) / 2)
+    return pic
+
+def add_picture_into_box(slide, img_path, left, top, box_w, box_h):
+    """Resmi belirtilen kutunun içine orantılı sığdırıp kutu içinde ortalar."""
+    pic = slide.shapes.add_picture(str(img_path), left, top)
+    ratio = min(box_w / pic.width, box_h / pic.height)
+    pic.width  = int(pic.width * ratio)
+    pic.height = int(pic.height * ratio)
+    pic.left   = int(left + (box_w - pic.width) / 2)
+    pic.top    = int(top  + (box_h - pic.height) / 2)
+    return pic
+
+# -----------------------------
+# Excel -> PNG (güvenli COM)
+# -----------------------------
+def export_excel_sheet_to_png(xlsx_path, sheet_name, out_png, scale=1.0):
+    """
+    Excel'de 'sheet_name' sayfasının UsedRange'ini PNG olarak dışa aktarır.
+    CopyPicture + Chart.Export yöntemi kullanılır. Excel süreçleri temiz kapanır.
+    """
+    import pythoncom
+    import win32com.client as win32
+
+    pythoncom.CoInitialize()
+    excel = None
+    wb = None
+    chart = None
+    try:
+        excel = win32.DispatchEx("Excel.Application")
+        excel.Visible = False
+        excel.DisplayAlerts = False
+
+        wb = excel.Workbooks.Open(str(xlsx_path), ReadOnly=True)
+        sheet = None
+        target = str(sheet_name).strip().lower()
+
+        # Tam eşleşme
+        for ws in wb.Worksheets:
+            if str(ws.Name).strip().lower() == target:
+                sheet = ws
+                break
+        # Kısmi eşleşme
+        if sheet is None:
+            for ws in wb.Worksheets:
+                if target in str(ws.Name).strip().lower():
+                    sheet = ws
+                    break
+
+        if sheet is None:
+            raise ValueError(f"Excel sayfası bulunamadı: '{sheet_name}'")
+
+        used = sheet.UsedRange
+        used.CopyPicture(Format=2)  # Bitmap
+        chart = wb.Charts.Add()
+        chart.Activate()
+        chart.Paste()
+
+        if scale and scale != 1.0:
+            chart.Parent.Width  = int(chart.Parent.Width * scale)
+            chart.Parent.Height = int(chart.Parent.Height * scale)
+
+        chart.Export(str(out_png))  # PNG
+    finally:
+        try:
+            if chart:
+                chart.Delete()
+        except Exception:
+            pass
+        try:
+            if wb:
+                wb.Close(SaveChanges=False)
+        except Exception:
+            pass
+        try:
+            if excel:
+                excel.Quit()
+        except Exception:
+            pass
+        pythoncom.CoUninitialize()
+
+# -----------------------------
+# Tesis kapasitesi okuma (sheet'ten)
+# -----------------------------
+def read_capacity_from_sheet(xlsx_path: Path, sheet_name: str) -> float:
+    """Tesis sheet'inde kapasite B2'de. Bulunamazsa 0 döner."""
+    try:
+        wb = openpyxl.load_workbook(xlsx_path, data_only=True, read_only=True)
+        if sheet_name not in wb.sheetnames:
+            target = sheet_name.strip().lower()
+            for s in wb.sheetnames:
+                if s.strip().lower() == target or target in s.strip().lower():
+                    sheet_name = s
+                    break
+        if sheet_name not in wb.sheetnames:
+            wb.close()
+            return 0.0
+        ws = wb[sheet_name]
+        val = ws["B2"].value
+        wb.close()
+        try:
+            return float(val) if val is not None else 0.0
+        except Exception:
+            return 0.0
+    except Exception:
+        return 0.0
+    
+    
+def get_unique_path(base_path: Path) -> Path:
+    """
+    Eğer base_path zaten varsa sonuna _1, _2 ... ekleyerek benzersiz bir path döndürür.
+    """
+    if not base_path.exists():
+        return base_path
+    stem = base_path.stem
+    suffix = base_path.suffix
+    parent = base_path.parent
+    i = 1
+    while True:
+        new_name = f"{stem}_{i}{suffix}"
+        candidate = parent / new_name
+        if not candidate.exists():
+            return candidate
+        i += 1
+
+# -----------------------------
+# Sunum oluşturma (tek il)
+# -----------------------------
+def build_presentation_for_province(il: str):
+    xlsx_path = TABLE_DIR / f"{il}.xlsx"
+    if not xlsx_path.exists():
+        print(f"[{il}] Uyarı: Excel bulunamadı: {xlsx_path}")
+        return
+
+    if not TEMPLATE_PATH.exists():
+        raise FileNotFoundError(f"Şablon yok: {TEMPLATE_PATH}")
+
+    print(f"[{il}] sunum hazırlanıyor...")
+    prs = Presentation(str(TEMPLATE_PATH))
+
+    # --- 0) İl Ana Sayfası (slayt 0) ---
+    if len(prs.slides) == 0:
+        prs.slides.add_slide(prs.slide_layouts[5])
+    get_or_create_title(prs.slides[0], f"{il} İli Ana Sayfa", font_size=30, bold=True)
+
+    # --- 1) İl Değerlendirme (slayt 1) ---
+    if len(prs.slides) < 2:
+        prs.slides.add_slide(prs.slide_layouts[5])  # boş sayfa bırak
+
+    # --- 2) Grafik slaytları ---
+    for year in YEARS:
+        slide = prs.slides.add_slide(prs.slide_layouts[5])  # boş düzen
+        get_or_create_title(slide, f"{il} – {year}", font_size=26, bold=True)
+        graph_path = GRAPH_DIR / f"{il}_{year}_birlesik_grafik.png"
+        if graph_path.exists():
+            add_picture_scaled(prs, slide, graph_path, max_width=Inches(12.5), max_height=Inches(6.8))
+        else:
+            tf = slide.shapes.add_textbox(Inches(1), Inches(2.5), Inches(10), Inches(1.0)).text_frame
+            tf.text = f"Grafik bulunamadı: {graph_path.name}"
+            tf.paragraphs[0].font.size = Pt(16)
+
+    # --- 3) Tesis sayfaları ---
+    wb = openpyxl.load_workbook(xlsx_path, data_only=True)
+    sheets = [s for s in wb.sheetnames if s.strip().lower() != "il özeti"]
+    wb.close()
+
+    if not sheets:
+        print(f"[{il}] Uyarı: Tesis sheet'i bulunamadı.")
+        out_path = SUNUM_DIR / f"{il}_Rapor.pptx"
+        prs.save(str(out_path))
+        print(f"[{il}] -> {out_path.name} hazır (tesis sayfası yok).")
+        return
+
+    # Kapasiteye göre sırala (B2)
+    caps = [(s, read_capacity_from_sheet(xlsx_path, s)) for s in sheets]
+    caps_sorted = sorted(caps, key=lambda x: (x[1] if x[1] is not None else 0.0), reverse=True)
+
+    top5 = [name for name, _ in caps_sorted[:5]]
+    rest = [name for name, _ in caps_sorted[5:]]
+
+    with TemporaryDirectory() as td:
+        tmp = Path(td)
+
+        # 3.a) İlk 5 tesis
+        for sheet in top5:
+            out_png = tmp / f"{sheet}.png"
+            export_excel_sheet_to_png(xlsx_path, sheet, out_png, scale=1.0)
+            slide = prs.slides.add_slide(prs.slide_layouts[5])
+            get_or_create_title(slide, sheet, font_size=24, bold=True)
+            add_picture_scaled(prs, slide, out_png, max_width=Inches(12.5), max_height=Inches(6.8))
+
+        # 3.b) Kalanlar – 2x2 grid
+        BOX_W = Inches(6.2)
+        BOX_H = Inches(3.3)
+        LEFTS = [Inches(0.6), Inches(6.8)]
+        TOPS  = [Inches(1.2), Inches(4.7)]
+
+        def chunk4(seq):
+            for i in range(0, len(seq), 4):
+                yield seq[i:i+4]
+
+        for block_idx, block in enumerate(chunk4(rest), start=1):
+            slide = prs.slides.add_slide(prs.slide_layouts[5])
+            get_or_create_title(slide, f"Tesisler (Devam) – {block_idx}", font_size=22, bold=True)
+            for idx, sheet in enumerate(block):
+                r = idx // 2
+                c = idx % 2
+                out_png = tmp / f"{sheet}.png"
+                export_excel_sheet_to_png(xlsx_path, sheet, out_png, scale=1.0)
+                add_picture_into_box(slide, out_png, LEFTS[c], TOPS[r], BOX_W, BOX_H)
+
+    out_path = SUNUM_DIR / f"{il}_Rapor.pptx"
+    out_path = get_unique_path(out_path)  # versiyon ekle
+    prs.save(str(out_path))
+    print(f"[{il}] -> {out_path.name} hazır.")
+
+
+# -----------------------------
+# Tümünü çalıştır
+# -----------------------------
+def main():
+    if IL_FILTER is None:
+        provinces = [p.stem for p in TABLE_DIR.glob("*.xlsx")]
+    else:
+        provinces = IL_FILTER
+    for il in provinces:
+        build_presentation_for_province(il)
+
+if __name__ == "__main__":
+    main()
