@@ -1,0 +1,348 @@
+# -*- coding: utf-8 -*-
+"""
+Türkiye İl Değerlendirme – 2024 referanslı tek dosya boru hattı
+- İl başına tek Excel; içinde tesis başına bir sheet + "İl Özeti" sheet
+- 2024'te parametre azaltımı olan tesislerde izleme/perf = 100 kabulü
+- Pasta grafikler (Giriş/Çıkış) 2022/2023/2024, 300 dpi
+- Tesis sayfalarında A–F tekrarlarını merge etme
+- NaN sınıf hücreleri '-' yazılır
+- Tesis sayfalarında yalnız A2/A3 görülen parametreler listelenir; aşım yoksa tek bilgi satırı
+- KAPASİTE sahası, 'KAPASİTE GÜNCEL.xlsx' içindeki değerle güncellenir
+"""
+
+import re
+from pathlib import Path
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
+from openpyxl.utils import get_column_letter
+
+try:
+    from docx import Document as DocxDocument
+except Exception:
+    DocxDocument = None
+
+# ==========================
+# SABİTLER
+# ==========================
+FILE_PATH = r"C:\Users\serhat.gunaydin\Desktop\Türkiye Değerlendirme Kodlar\2024 İl Değerlendirme\Ham Veri\Birleştirilmiş Veri.xlsx"
+SHEET_NAME = "UNIFIED"
+
+# >>> YENİ: Kapasite güncelleme dosyası
+CAPACITY_FILE_PATH = r"C:\Users\serhat.gunaydin\Desktop\Türkiye Değerlendirme Kodlar\2024 İl Değerlendirme\Ham Veri\KAPASİTE GÜNCEL.xlsx"
+
+EXCEPTIONS_TXT_PATH = r"C:\Users\serhat.gunaydin\Desktop\Türkiye Değerlendirme Kodlar\2024 İl Değerlendirme\Ham Veri\Parametre Azaltımı Yapılmış Olan Tesisler.txt"
+EXCEPTIONS_DOCX_PATH = r"C:\Users\serhat.gunaydin\Desktop\Türkiye Değerlendirme Kodlar\2024 İl Değerlendirme\Ham Veri\Parametre Azaltımı Yapılmış Olan Tesisler.docx"
+
+OUTPUT_DIR = r"C:\Users\serhat.gunaydin\Desktop\Türkiye Değerlendirme Kodlar\2024 İl Değerlendirme\Çıktılar"
+
+VERI_YOK_ESIK = 60.0
+YEARS = [2022, 2023, 2024]
+
+COLOR_A1, COLOR_A2, COLOR_A3, COLOR_VY = "green", "yellow", "red", "gray"
+
+FONT = Font(name="Garamond", size=11)
+FONT_BOLD = Font(name="Garamond", size=11, bold=True)
+HEADER_FILL = PatternFill("solid", fgColor="6DA7A9")
+THIN = Side(border_style="thin", color="8AA6A8")
+BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
+CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
+LEFT = Alignment(horizontal="left", vertical="center", wrap_text=True)
+
+# Sütun adları
+COL_IL   = "ARITMA TESİS İL ADI"
+COL_ILCE = "ARITMA TESİS İLÇE ADI"
+COL_TESIS = "ARITMA TESİS ADI"
+COL_KAP = "KAPASİTE (m^3/d)"
+COL_KAYNAK = "SU KAYNAĞI"
+COL_TIP = "ARITMA TİPİ"
+COL_SIK = {2022:"2022 İzleme Sıklığı Performansı %", 2023:"2023 İzleme Sıklığı Performansı %", 2024:"2024 İzleme Sıklığı Performansı %"}
+COL_PAR = {2022:"2022 Parametre İzleme Performansı %", 2023:"2023 Parametre İzleme Performansı %", 2024:"2024 Parametre İzleme Performansı %"}
+COL_PARAM = "PARAMETRE ADI"
+COL_GIRIS = {2022:"GİRİŞ KALİTE SINIFI 2022", 2023:"GİRİŞ KALİTE SINIFI 2023", 2024:"GİRİŞ KALİTE SINIFI 2024"}
+COL_CIKIS = {2022:"ÇIKIŞ KALİTE SINIFI 2022", 2023:"ÇIKIŞ KALİTE SINIFI 2023", 2024:"ÇIKIŞ KALİTE SINIFI 2024"}
+
+# ==========================
+# YARDIMCILAR
+# ==========================
+def ensure_dir(p: Path): p.mkdir(parents=True, exist_ok=True)
+
+def sanitize(x):
+    if x is None: return ""
+    return str(x).strip().replace("\u200b","").replace("\xa0"," ")
+
+def fmt_class(x):
+    s = sanitize(x)
+    return "-" if (s=="" or s.upper() in ("NAN","NONE")) else s.upper()
+
+def _norm_class(x):
+    s = str(x).strip().upper()
+    if s in ("","NAN","NONE"): return "-"
+    s = re.sub(r"[^A-Z0-9]+","", s)
+    return s if s in {"A1","A2","A3"} else "-"
+
+def row_has_exceedance(row) -> bool:
+    for y in YEARS:
+        if _norm_class(row[COL_GIRIS[y]]) in {"A2","A3"}: return True
+        if _norm_class(row[COL_CIKIS[y]]) in {"A2","A3"}: return True
+    return False
+
+def filter_params_with_exceedance(df_params: pd.DataFrame) -> pd.DataFrame:
+    if df_params is None or df_params.empty: return df_params
+    return df_params.loc[df_params.apply(row_has_exceedance, axis=1)].copy()
+
+def read_exceptions() -> set:
+    names=set()
+    txt=Path(EXCEPTIONS_TXT_PATH)
+    if txt.exists():
+        for enc in ("cp1254","utf-8","latin-5"):
+            try:
+                with open(txt,"r",encoding=enc,errors="ignore") as f:
+                    for line in f:
+                        n=sanitize(line)
+                        if n: names.add(n)
+                break
+            except Exception: continue
+    docx=Path(EXCEPTIONS_DOCX_PATH)
+    if docx.exists() and DocxDocument is not None:
+        try:
+            d=DocxDocument(str(docx))
+            for p in d.paragraphs:
+                n=sanitize(p.text)
+                if n: names.add(n)
+        except Exception: pass
+    return names
+
+# >>> YENİ: Kapasite güncelleme okuyucu
+def load_capacity_override() -> pd.DataFrame:
+    cap_path = Path(CAPACITY_FILE_PATH)
+    if not cap_path.exists():
+        return pd.DataFrame(columns=[COL_IL, COL_TESIS, COL_KAP])
+    cap = pd.read_excel(str(cap_path), sheet_name=0)
+    # beklenen başlıklar: ARITMA TESİS İL ADI | ARITMA TESİS ADI | KAPASİTE (m^3/d)
+    for c in [COL_IL, COL_TESIS]:
+        if c not in cap.columns:
+            raise KeyError(f"Kapasite güncelleme dosyasında eksik sütun: {c}")
+        cap[c] = cap[c].astype(str).map(sanitize)
+    if COL_KAP not in cap.columns:
+        raise KeyError(f"Kapasite güncelleme dosyasında eksik sütun: {COL_KAP}")
+    cap[COL_KAP] = pd.to_numeric(cap[COL_KAP], errors="coerce")
+    # her (İl, Tesis) için tek satır bırak
+    cap = (cap
+           .dropna(subset=[COL_TESIS])
+           .sort_values([COL_IL, COL_TESIS])
+           .drop_duplicates(subset=[COL_IL, COL_TESIS], keep="last"))
+    return cap[[COL_IL, COL_TESIS, COL_KAP]]
+
+def load_data():
+    df = pd.read_excel(FILE_PATH, sheet_name=SHEET_NAME)
+
+    # metin kolonları
+    for c in [COL_IL, COL_ILCE, COL_TESIS, COL_KAYNAK, COL_TIP, COL_PARAM]:
+        if c in df.columns: df[c] = df[c].astype(str).map(sanitize)
+        else: raise KeyError(f"Gerekli sütun bulunamadı: {c}")
+
+    # sayısal kolonlar
+    for y in YEARS:
+        for col in (COL_SIK[y], COL_PAR[y]):
+            if col in df.columns: df[col] = pd.to_numeric(df[col], errors="coerce")
+        for col in (COL_GIRIS[y], COL_CIKIS[y]):
+            if col in df.columns: df[col] = df[col].astype(str).map(sanitize)
+
+    # kapasite: önce ana dosyadaki sayılaştırma
+    df[COL_KAP] = pd.to_numeric(df[COL_KAP], errors="coerce")
+
+    # >>> YENİ: kapasite override merge
+    cap = load_capacity_override()
+    if not cap.empty:
+        df = df.merge(cap, on=[COL_IL, COL_TESIS], how="left", suffixes=("", "_OVR"))
+        # OVR varsa onu kullan; yoksa eskiyi koru
+        df[COL_KAP] = np.where(pd.notna(df[f"{COL_KAP}_OVR"]), df[f"{COL_KAP}_OVR"], df[COL_KAP])
+        df.drop(columns=[f"{COL_KAP}_OVR"], inplace=True)
+
+    return df
+
+def apply_muaf_tesis_2024(df: pd.DataFrame) -> pd.DataFrame:
+    names = read_exceptions()
+    if not names: return df
+    mask = df[COL_TESIS].isin(names)
+    df.loc[mask, COL_SIK[2024]] = 100.0
+    df.loc[mask, COL_PAR[2024]] = 100.0
+    return df
+
+def style_header(ws, row=1):
+    for cell in ws[row]:
+        cell.font = FONT_BOLD; cell.alignment = CENTER
+        cell.fill = HEADER_FILL; cell.border = BORDER
+
+def style_table(ws, min_row, min_col, max_row, max_col):
+    for r in range(min_row, max_row+1):
+        for c in range(min_col, max_col+1):
+            cell = ws.cell(r,c)
+            if r==min_row:
+                cell.font=FONT_BOLD; cell.fill=HEADER_FILL; cell.alignment=CENTER
+            else:
+                cell.font=FONT; cell.alignment = LEFT if c==min_col else CENTER
+            cell.border=BORDER
+
+def color_quality_cells(ws, start_row, years_cols, n_rows):
+    for r in range(start_row, start_row+n_rows):
+        for c in years_cols:
+            val = str(ws.cell(r,c).value).upper()
+            if val in ("", "NAN"): val = "-"
+            if val=="A1": fill="92D050"
+            elif val=="A2": fill="FFEB84"
+            elif val=="A3": fill="FF7C80"
+            else: fill="BFBFBF"
+            ws.cell(r,c).fill = PatternFill("solid", fgColor=fill)
+
+def autosize(ws):
+    widths={}
+    for row in ws.rows:
+        for cell in row:
+            if cell.value:
+                widths[cell.column]=max(widths.get(cell.column,0), len(str(cell.value)))
+    for col,w in widths.items():
+        ws.column_dimensions[get_column_letter(col)].width = min(max(w+2,10),42)
+
+def merge_repeated_cells(ws, first_data_row=2, merge_cols=("A","B","C","D","E","F")):
+    max_row=ws.max_row
+    if max_row<first_data_row: return
+    cur=ws[f"A{first_data_row}"].value; start=first_data_row
+    def _merge(r1,r2):
+        if r2<=r1: return
+        for L in merge_cols:
+            idx=ws[f"{L}1"].column
+            ws.merge_cells(start_row=r1, start_column=idx, end_row=r2, end_column=idx)
+            ws.cell(r1,idx).alignment = Alignment(horizontal="center", vertical="center")
+    for r in range(first_data_row+1, max_row+1):
+        key=ws[f"A{r}"].value
+        if key!=cur: _merge(start, r-1); start=r; cur=key
+    _merge(start, max_row)
+
+# ==========================
+# ÇIKTI OLUŞTURUCU
+# ==========================
+def build_facility_sheet(wb, sheet_name, df_fac):
+    ws = wb.create_sheet(title=sheet_name[:31])
+
+    headers = [
+        "ARITMA TESİS ADI","KAPASİTE (m^3/d)","SU KAYNAĞI","ARITMA TİPİ",
+        "2024 İzleme Sıklığı %","2024 Parametre İzleme %",
+        "Parametre Adı","GİRİŞ 2022","GİRİŞ 2023","GİRİŞ 2024","ÇIKIŞ 2022","ÇIKIŞ 2023","ÇIKIŞ 2024",
+    ]
+    ws.append(headers); style_header(ws,1)
+
+    tname = df_fac[COL_TESIS].iloc[0]
+    kap   = df_fac[COL_KAP].iloc[0]
+    kaynak= df_fac[COL_KAYNAK].iloc[0]
+    atip  = df_fac[COL_TIP].iloc[0]
+    iz2024= df_fac[COL_SIK[2024]].iloc[0]
+    par2024= df_fac[COL_PAR[2024]].iloc[0]
+
+    df_fac_f = filter_params_with_exceedance(df_fac)
+
+    if df_fac_f.empty:
+        ws.append([tname,kap,kaynak,atip,iz2024,par2024,"","-","-","-","-","-","-"])
+        n_rows=1
+    else:
+        for _,r in df_fac_f.iterrows():
+            ws.append([
+                tname,kap,kaynak,atip,iz2024,par2024,
+                r[COL_PARAM],
+                fmt_class(r[COL_GIRIS[2022]]), fmt_class(r[COL_GIRIS[2023]]), fmt_class(r[COL_GIRIS[2024]]),
+                fmt_class(r[COL_CIKIS[2022]]), fmt_class(r[COL_CIKIS[2023]]), fmt_class(r[COL_CIKIS[2024]]),
+            ])
+        n_rows=len(df_fac_f)
+
+    style_table(ws,1,1,1+n_rows,13)
+    color_quality_cells(ws,2,list(range(8,14)),n_rows)
+    autosize(ws)
+    merge_repeated_cells(ws,2,("A","B","C","D","E","F"))
+    return ws
+
+def build_province_summary_sheet(wb, il_name, df_il):
+    ws = wb.create_sheet(title="İl Özeti")
+    headers = [
+        "ARITMA TESİS ADI","KAPASİTE (m^3/d)","SU KAYNAĞI","ARITMA TİPİ",
+        "2024 İzleme Sıklığı %","2024 Parametre İzleme %",
+        "Parametre Adı","GİRİŞ 2022","GİRİŞ 2023","GİRİŞ 2024","ÇIKIŞ 2022","ÇIKIŞ 2023","ÇIKIŞ 2024",
+    ]
+    ws.append(headers); style_header(ws,1)
+
+    for tesis, df_t in df_il.groupby(COL_TESIS, sort=True):
+        kap = df_t[COL_KAP].iloc[0]; kaynak=df_t[COL_KAYNAK].iloc[0]
+        atip=df_t[COL_TIP].iloc[0]; iz=df_t[COL_SIK[2024]].iloc[0]; par=df_t[COL_PAR[2024]].iloc[0]
+
+        df_v = filter_params_with_exceedance(df_t)
+
+        if df_v.empty:
+            ws.append([tesis,kap,kaynak,atip,iz,par,"","-","-","-","-","-","-"])
+        else:
+            for _,r in df_v.iterrows():
+                ws.append([
+                    tesis,kap,kaynak,atip,iz,par,
+                    r[COL_PARAM],
+                    fmt_class(r[COL_GIRIS[2022]]), fmt_class(r[COL_GIRIS[2023]]), fmt_class(r[COL_GIRIS[2024]]),
+                    fmt_class(r[COL_CIKIS[2022]]), fmt_class(r[COL_CIKIS[2023]]), fmt_class(r[COL_CIKIS[2024]]),
+                ])
+
+    n_rows = max(ws.max_row-1, 1)
+    style_table(ws,1,1,1+n_rows,13)
+    color_quality_cells(ws,2,list(range(8,14)),n_rows)
+    autosize(ws)
+    merge_repeated_cells(ws,2,("A","B","C","D","E","F"))
+    return ws
+
+def make_pies_for_province(df_il, il_name, year, out_dir: Path):
+    giris = df_il[COL_GIRIS[year]].fillna("-").str.upper().replace({"":"-","NAN":"-"})
+    cikis = df_il[COL_CIKIS[year]].fillna("-").str.upper().replace({"":"-","NAN":"-"})
+
+    def dist(series, sik_col, par_col):
+        c = series.value_counts()
+        a1,a2,a3,vy = int(c.get("A1",0)), int(c.get("A2",0)), int(c.get("A3",0)), int(c.get("-",0))
+        perf_mask = (df_il[sik_col].fillna(0) >= VERI_YOK_ESIK) & (df_il[par_col].fillna(0) >= VERI_YOK_ESIK)
+        vy += int((~perf_mask).sum())
+        tot = max(a1+a2+a3+vy,1)
+        return {"A1":a1/tot, "A2":a2/tot, "A3":a3/tot, "Veri Yok":vy/tot}
+
+    dg, dc = dist(giris, COL_SIK[year], COL_PAR[year]), dist(cikis, COL_SIK[year], COL_PAR[year])
+
+    labels = ["A1","A2","A3","Veri Yok"]; colors=[COLOR_A1,COLOR_A2,COLOR_A3,COLOR_VY]
+    fig,axes = plt.subplots(1,2, figsize=(14,6), dpi=300)
+    fig.suptitle(f"{il_name} - {year}", fontweight="bold", fontsize=28, fontname="Garamond")
+    w1,_=axes[0].pie([dg[k]*100 for k in labels], labels=None, colors=colors, startangle=90, wedgeprops=dict(edgecolor='white'))
+    axes[0].set_title("Giriş", fontname="Garamond", fontsize=20, fontweight="bold")
+    w2,_=axes[1].pie([dc[k]*100 for k in labels], labels=None, colors=colors, startangle=90, wedgeprops=dict(edgecolor='white'))
+    axes[1].set_title("Çıkış", fontname="Garamond", fontsize=20, fontweight="bold")
+    fig.legend(w1, [f"{lab} ({dg[lab]*100:.2f}%)" for lab in labels], loc="lower left", bbox_to_anchor=(0.02,0.02), ncol=4, frameon=False, prop={'family':'Garamond','size':12})
+    fig.legend(w2, [f"{lab} ({dc[lab]*100:.2f}%)" for lab in labels], loc="lower right", bbox_to_anchor=(0.98,0.02), ncol=4, frameon=False, prop={'family':'Garamond','size':12})
+    ensure_dir(out_dir); plt.savefig(out_dir / f"{il_name}_{year}_birlesik_grafik.png", dpi=300, bbox_inches="tight"); plt.close(fig)
+
+def province_excel_and_charts(df: pd.DataFrame):
+    out_tables = Path(OUTPUT_DIR)/"Tablolar"; out_charts = Path(OUTPUT_DIR)/"Grafikler"
+    ensure_dir(out_tables); ensure_dir(out_charts)
+    for il, df_il in df.groupby(COL_IL, sort=True):
+        wb = Workbook(); wb.remove(wb.active)
+        build_province_summary_sheet(wb, il, df_il)
+        for tesis, df_fac in df_il.groupby(COL_TESIS, sort=True):
+            build_facility_sheet(wb, tesis, df_fac)
+        wb.save(str(out_tables / f"{il}.xlsx".replace("/","-")))
+        for y in YEARS: make_pies_for_province(df_il, il, y, out_charts)
+
+# ==========================
+def main():
+    print("Veri yükleniyor...")
+    df = load_data()
+    print("Parametre azaltımı 2024=100 uygulanıyor...")
+    df = apply_muaf_tesis_2024(df)
+    print("İl bazında excel ve grafikler üretiliyor...")
+    province_excel_and_charts(df)
+    print("Tamamlandı.")
+    print(f"Çıktılar klasörü: {OUTPUT_DIR}")
+
+if __name__ == "__main__":
+    main()
